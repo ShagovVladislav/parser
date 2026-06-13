@@ -1,33 +1,117 @@
-import { chromium } from 'playwright';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import process from 'node:process';
+import { chromium, errors as playwrightErrors } from 'playwright';
 
 const DEFAULT_MAX_REVIEWS = 600;
-const DEFAULT_TIMEOUT = 60000;
+const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_DEBUG_DIR = './debug';
+const SCROLL_ITERATION_LIMIT = 120;
 
-const inputUrl = process.argv[2];
-const maxReviewsArg = Number(process.argv[3]);
+const DEBUG_STEPS = {
+  initial: '01-initial-page',
+  cardLoaded: '02-after-card-loaded',
+  reviewsOpened: '03-after-reviews-opened',
+  afterScroll: '04-after-scroll',
+};
 
-const maxReviews = Number.isFinite(maxReviewsArg)
-  ? maxReviewsArg
-  : DEFAULT_MAX_REVIEWS;
+const SERVICE_TEXTS = [
+  'Подписаться',
+  'Вы подписаны',
+  'Ещё',
+  'Показать полностью',
+  'Читать полностью',
+  'Нравится',
+  'Ответить',
+  'Пожаловаться',
+  'Поделиться',
+];
 
-if (!inputUrl) {
-  printErrorAndExit('Usage: node yandex-parser.js <yandex-maps-url> [maxReviews]');
+const ERROR_CODES = new Set([
+  'INVALID_USAGE',
+  'INVALID_URL',
+  'INVALID_HOST',
+  'INVALID_MAPS_URL',
+  'COMPANY_ID_NOT_FOUND',
+  'CARD_NOT_LOADED',
+  'REVIEWS_TAB_NOT_FOUND',
+  'REVIEWS_CONTAINER_NOT_FOUND',
+  'YANDEX_BLOCKED',
+  'PARSER_TIMEOUT',
+  'INVALID_RESULT',
+  'UNKNOWN_ERROR',
+]);
+
+async function bootstrap() {
+  const rawArgs = process.argv.slice(2);
+
+  if (hasHelpFlag(rawArgs)) {
+    printHelp();
+    return;
+  }
+
+  const debug = getBootstrapDebugState(rawArgs);
+
+  try {
+    const options = parseCliArgs(rawArgs);
+    Object.assign(debug, {
+      enabled: options.debug,
+      dir: path.resolve(options.debugDir),
+    });
+
+    await prepareDebugDir(debug);
+    debugLog(debug, `Parser started with max_reviews=${options.maxReviews}, timeout_ms=${options.timeoutMs}`);
+
+    let activeBrowser = null;
+    const startedAt = Date.now();
+    const runState = {
+      startedAt,
+      deadlineAt: startedAt + options.timeoutMs,
+      debug,
+      getBrowser: () => activeBrowser,
+      setBrowser: (browser) => {
+        activeBrowser = browser;
+      },
+    };
+
+    const result = await runWithGlobalTimeout(
+      () => runParser(options, runState),
+      options.timeoutMs,
+      runState
+    );
+
+    await writeDebugJson(debug, 'result.json', result);
+    console.log(JSON.stringify(result, null, 2));
+  } catch (error) {
+    const envelope = createErrorEnvelope(error);
+
+    await writeDebugJson(debug, 'error.json', envelope);
+    console.error(JSON.stringify(envelope, null, 2));
+    process.exitCode = 1;
+  }
 }
 
-async function main() {
-assertYandexMapsUrl(inputUrl);
+async function runParser(options, state) {
+  assertYandexMapsUrl(options.inputUrl);
 
-let companyId = tryExtractCompanyIdFromUrl(inputUrl);
+  let companyId = tryExtractCompanyIdFromUrl(options.inputUrl);
+  let browser = null;
 
-const browser = await chromium.launch({
-  headless: true,
-  args: [
-    '--no-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-setuid-sandbox',
-  ],
-});
   try {
+    ensureNotTimedOut(state);
+    debugLog(state.debug, 'Launching Chromium');
+
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-setuid-sandbox',
+      ],
+    });
+    state.setBrowser(browser);
+
     const context = await browser.newContext({
       locale: 'ru-RU',
       viewport: {
@@ -40,62 +124,265 @@ const browser = await chromium.launch({
     });
 
     const page = await context.newPage();
+    page.setDefaultTimeout(getActionTimeout(state));
+    page.setDefaultNavigationTimeout(getActionTimeout(state));
 
-    page.setDefaultTimeout(DEFAULT_TIMEOUT);
+    debugLog(state.debug, 'Opening source URL');
+    await page.goto(options.inputUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: getActionTimeout(state),
+    });
+    await page.waitForTimeout(2500);
+    await assertNotYandexBlocked(page);
+    await saveDebugPage(page, state.debug, DEBUG_STEPS.initial);
 
-await page.goto(inputUrl, {
-  waitUntil: 'domcontentloaded',
-  timeout: DEFAULT_TIMEOUT,
-});
+    if (!companyId) {
+      companyId = tryExtractCompanyIdFromUrl(page.url());
+    }
 
-await page.waitForTimeout(2500);
+    if (!companyId) {
+      debugLog(state.debug, 'Company ID was not found in URL, scanning page payload');
+      companyId = await tryExtractCompanyIdFromPage(page);
+    }
 
-if (!companyId) {
-  companyId = tryExtractCompanyIdFromUrl(page.url());
-}
+    if (!companyId) {
+      throw new ParserError(
+        'COMPANY_ID_NOT_FOUND',
+        'Не удалось определить ID организации из ссылки или открытой страницы.',
+        { source_url: options.inputUrl, final_url: page.url() }
+      );
+    }
 
-if (!companyId) {
-  companyId = await tryExtractCompanyIdFromPage(page);
-}
+    debugLog(state.debug, `Company ID resolved: ${companyId}`);
+    await waitForMapCard(page);
+    await assertNotYandexBlocked(page);
+    await saveDebugPage(page, state.debug, DEBUG_STEPS.cardLoaded);
 
-if (!companyId) {
-  throw new ParserError(
-    'COMPANY_ID_NOT_FOUND',
-    'Не удалось определить ID организации из ссылки или открытой страницы.'
-  );
-}
+    const organization = await parseOrganizationInfo(page, companyId);
 
-await waitForMapCard(page);
+    debugLog(state.debug, 'Opening reviews tab');
+    await openReviewsTab(page, companyId, state);
+    await assertNotYandexBlocked(page);
+    await saveDebugPage(page, state.debug, DEBUG_STEPS.reviewsOpened);
 
-const organization = await parseOrganizationInfo(page, companyId);
+    const reviewCountFromPage = await extractReviewCountFromReviewsPage(page);
 
-await openReviewsTab(page);
+    if (organization.rating === null) {
+      organization.rating = await extractRating(page);
+    }
 
-const reviewCountFromPage = await extractReviewCountFromReviewsPage(page);
+    if (organization.ratingCount === null) {
+      organization.ratingCount = await extractRatingCount(page);
+    }
 
-const reviews = await collectReviews(page, maxReviews);
+    debugLog(state.debug, 'Collecting reviews');
+    const reviews = await collectReviews(page, options.maxReviews, state);
+    await saveDebugPage(page, state.debug, DEBUG_STEPS.afterScroll);
 
-const result = {
-  organization: {
-    yandex_company_id: companyId,
-    name: organization.name,
-    rating: organization.rating,
-    rating_count: organization.ratingCount,
-    review_count: reviewCountFromPage ?? reviews.length,
-    },
-  reviews,
-  meta: {
-      source_url: inputUrl,
-      parsed_reviews_count: reviews.length,
-      max_reviews: maxReviews,
-      parsed_at: new Date().toISOString(),
-  },
-};
+    const warnings = [];
+    const result = buildResult({
+      organization,
+      reviews,
+      sourceUrl: options.inputUrl,
+      finalUrl: page.url(),
+      maxReviews: options.maxReviews,
+      reviewCountFromPage,
+      startedAt: state.startedAt,
+      warnings,
+    });
 
-    console.log(JSON.stringify(result, null, 2));
+    validateResult(result);
+    debugLog(state.debug, `Parser finished, parsed_reviews_count=${result.reviews.length}`);
+
+    return result;
   } finally {
-    await browser.close();
+    state.setBrowser(null);
+    await closeBrowser(browser, state.debug);
   }
+}
+
+async function runWithGlobalTimeout(task, timeoutMs, state) {
+  let timeoutId = null;
+  let timedOut = false;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      debugLog(state.debug, 'Global parser timeout reached');
+      void closeBrowser(state.getBrowser(), state.debug);
+      reject(
+        new ParserError(
+          'PARSER_TIMEOUT',
+          `Превышено общее время работы парсера: ${timeoutMs} мс.`,
+          { timeout_ms: timeoutMs }
+        )
+      );
+    }, timeoutMs);
+  });
+
+  const taskPromise = task().catch((error) => {
+    if (timedOut || isPlaywrightTimeout(error)) {
+      throw new ParserError(
+        'PARSER_TIMEOUT',
+        `Превышено общее время работы парсера: ${timeoutMs} мс.`,
+        { timeout_ms: timeoutMs }
+      );
+    }
+
+    throw error;
+  });
+
+  try {
+    return await Promise.race([taskPromise, timeoutPromise]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function parseCliArgs(args) {
+  const options = {
+    inputUrl: null,
+    maxReviews: DEFAULT_MAX_REVIEWS,
+    debug: false,
+    debugDir: DEFAULT_DEBUG_DIR,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  };
+  const positional = [];
+  let maxReviewsFromOption = null;
+
+  for (const arg of args) {
+    if (arg === '--debug') {
+      options.debug = true;
+      continue;
+    }
+
+    if (arg.startsWith('--max-reviews=')) {
+      maxReviewsFromOption = parsePositiveIntegerOption(arg, '--max-reviews');
+      continue;
+    }
+
+    if (arg.startsWith('--timeout=')) {
+      options.timeoutMs = parsePositiveIntegerOption(arg, '--timeout');
+      continue;
+    }
+
+    if (arg.startsWith('--debug-dir=')) {
+      const value = arg.slice('--debug-dir='.length).trim();
+
+      if (!value) {
+        throw new ParserError(
+          'INVALID_USAGE',
+          'Параметр --debug-dir должен содержать путь.',
+          { option: '--debug-dir' }
+        );
+      }
+
+      options.debugDir = value;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      throw new ParserError(
+        'INVALID_USAGE',
+        `Неизвестный параметр: ${arg}`,
+        { option: arg }
+      );
+    }
+
+    positional.push(arg);
+  }
+
+  if (positional.length === 0) {
+    throw new ParserError(
+      'INVALID_USAGE',
+      'Не передан URL организации Яндекс.Карт.',
+      { usage: getUsageLine() }
+    );
+  }
+
+  if (positional.length > 2) {
+    throw new ParserError(
+      'INVALID_USAGE',
+      'Передано слишком много позиционных аргументов.',
+      { usage: getUsageLine() }
+    );
+  }
+
+  options.inputUrl = positional[0];
+
+  if (!options.inputUrl || !options.inputUrl.trim()) {
+    throw new ParserError(
+      'INVALID_USAGE',
+      'URL организации не должен быть пустым.',
+      { usage: getUsageLine() }
+    );
+  }
+
+  if (positional[1] !== undefined) {
+    options.maxReviews = parsePositiveInteger(positional[1], 'maxReviews');
+  }
+
+  if (maxReviewsFromOption !== null) {
+    options.maxReviews = maxReviewsFromOption;
+  }
+
+  return options;
+}
+
+function parsePositiveIntegerOption(rawArg, optionName) {
+  const value = rawArg.slice(`${optionName}=`.length);
+  return parsePositiveInteger(value, optionName);
+}
+
+function parsePositiveInteger(value, label) {
+  if (!/^\d+$/.test(String(value))) {
+    throw new ParserError(
+      'INVALID_USAGE',
+      `Параметр ${label} должен быть положительным целым числом.`,
+      { option: label, value }
+    );
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new ParserError(
+      'INVALID_USAGE',
+      `Параметр ${label} должен быть положительным целым числом.`,
+      { option: label, value }
+    );
+  }
+
+  return parsed;
+}
+
+function hasHelpFlag(args) {
+  return args.includes('--help') || args.includes('-h');
+}
+
+function getUsageLine() {
+  return 'node yandex-parser.js "<yandex-maps-url>" [maxReviews] [--max-reviews=N] [--timeout=MS] [--debug] [--debug-dir=DIR]';
+}
+
+function printHelp() {
+  console.log(`Yandex Maps organization reviews parser
+
+Usage:
+  node yandex-parser.js "<yandex-maps-url>"
+  node yandex-parser.js "<yandex-maps-url>" 700
+  node yandex-parser.js "<yandex-maps-url>" --max-reviews=700
+  node yandex-parser.js "<yandex-maps-url>" 700 --debug
+  node yandex-parser.js "<yandex-maps-url>" --debug --debug-dir=./debug --timeout=300000
+
+Options:
+  --max-reviews=N   Maximum number of reviews to collect. Default: ${DEFAULT_MAX_REVIEWS}
+  --timeout=MS      Global parser timeout in milliseconds. Default: ${DEFAULT_TIMEOUT_MS}
+  --debug           Write progress logs to stderr and save screenshots/HTML.
+  --debug-dir=DIR   Directory for debug artifacts. Default: ${DEFAULT_DEBUG_DIR}
+  --help, -h        Show this help.
+`);
 }
 
 function assertYandexMapsUrl(url) {
@@ -104,29 +391,43 @@ function assertYandexMapsUrl(url) {
   try {
     parsedUrl = new URL(url);
   } catch {
-    throw new ParserError('INVALID_URL', 'Передана некорректная ссылка.');
+    throw new ParserError('INVALID_URL', 'Передана некорректная ссылка.', {
+      source_url: url,
+    });
   }
 
-  const allowedHosts = [
-    'yandex.ru',
-    'www.yandex.ru',
-    'yandex.com',
-    'www.yandex.com',
-  ];
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    throw new ParserError('INVALID_URL', 'Ссылка должна использовать http или https.', {
+      protocol: parsedUrl.protocol,
+    });
+  }
 
-  if (!allowedHosts.includes(parsedUrl.hostname)) {
+  if (!isAllowedYandexHost(parsedUrl.hostname)) {
     throw new ParserError(
       'INVALID_HOST',
-      'Ссылка должна вести на yandex.ru/maps или yandex.com/maps.'
+      'Ссылка должна вести на yandex.ru/maps или yandex.com/maps.',
+      { host: parsedUrl.hostname }
     );
   }
 
   if (!parsedUrl.pathname.includes('/maps/')) {
     throw new ParserError(
       'INVALID_MAPS_URL',
-      'Ссылка должна вести на карточку организации в Яндекс.Картах.'
+      'Ссылка должна вести на карточку организации в Яндекс.Картах.',
+      { pathname: parsedUrl.pathname }
     );
   }
+}
+
+function isAllowedYandexHost(hostname) {
+  const normalized = hostname.toLowerCase();
+
+  return (
+    normalized === 'yandex.ru' ||
+    normalized.endsWith('.yandex.ru') ||
+    normalized === 'yandex.com' ||
+    normalized.endsWith('.yandex.com')
+  );
 }
 
 function tryExtractCompanyIdFromUrl(url) {
@@ -291,7 +592,8 @@ async function waitForMapCard(page) {
 
   throw new ParserError(
     'CARD_NOT_LOADED',
-    'Не удалось дождаться загрузки карточки организации.'
+    'Не удалось дождаться загрузки карточки организации.',
+    { url: page.url() }
   );
 }
 
@@ -333,6 +635,7 @@ async function extractRating(page) {
     '[class*="rating-badge-view__rating"]',
     '[class*="business-rating-badge-view__rating"]',
     '[aria-label*="Рейтинг"]',
+    '[aria-label*="рейтинг"]',
   ];
 
   for (const selector of selectors) {
@@ -344,48 +647,163 @@ async function extractRating(page) {
     }
   }
 
-  const bodyText = await page.locator('body').innerText().catch(() => '');
-  return parseRating(bodyText);
+  const candidateTexts = await page.evaluate(() => {
+    const texts = [];
+    const selectorsToScan = [
+      '[class*="rating"]',
+      '[class*="Rating"]',
+      '[aria-label*="Рейтинг"]',
+      '[aria-label*="рейтинг"]',
+    ];
+
+    for (const selector of selectorsToScan) {
+      document.querySelectorAll(selector).forEach((element) => {
+        const text = [
+          element.getAttribute('aria-label') || '',
+          element.getAttribute('title') || '',
+          element.textContent || '',
+        ].join(' ');
+
+        if (/рейтинг|rating/i.test(text)) {
+          texts.push(text);
+        }
+      });
+    }
+
+    return texts;
+  });
+
+  for (const text of candidateTexts) {
+    const rating = parseRating(text);
+
+    if (rating !== null) {
+      return rating;
+    }
+  }
+
+  return null;
 }
 
 async function extractRatingCount(page) {
-  const bodyText = await page.locator('body').innerText().catch(() => '');
-
-  const patterns = [
-    /(\d[\d\s]*)\s+оцен(?:ка|ки|ок)/i,
-    /(\d[\d\s]*)\s+рейтинг/i,
+  const directSelectors = [
+    '[class*="business-summary-rating-badge-view__rating-count"]',
+    '[class*="business-rating-amount-view"]',
+    '[class*="business-summary-rating"]',
   ];
 
-  return parseNumberByPatterns(bodyText, patterns);
+  for (const selector of directSelectors) {
+    const value = await getTextBySelector(page, selector);
+    const count = parseRatingCountFromText(value);
+
+    if (count !== null) {
+      return count;
+    }
+  }
+
+  const candidateTexts = await page.evaluate(() => {
+    const texts = [];
+    const selectorsToScan = [
+      '[class*="business-summary-rating-badge-view__rating-count"]',
+      '[class*="business-rating-amount-view"]',
+      '[class*="business-summary-rating"]',
+      '[class*="business-rating"]',
+      '[class*="rating"]',
+      '[aria-label*="оцен"]',
+      '[aria-label*="Оцен"]',
+      '[aria-label*="рейтинг"]',
+      '[aria-label*="Рейтинг"]',
+      'button',
+      'a',
+    ];
+
+    for (const selector of selectorsToScan) {
+      document.querySelectorAll(selector).forEach((element) => {
+        const text = [
+          element.getAttribute('aria-label') || '',
+          element.getAttribute('title') || '',
+          element.innerText || '',
+        ].join(' ');
+
+        if (
+          selector.includes('rating-count') ||
+          selector.includes('rating-amount') ||
+          /оцен|рейтинг/i.test(text)
+        ) {
+          texts.push(text);
+        }
+      });
+    }
+
+    return texts;
+  });
+
+  for (const text of candidateTexts) {
+    const count = parseRatingCountFromText(text);
+
+    if (count !== null) {
+      return count;
+    }
+  }
+
+  return null;
+}
+
+function parseRatingCountFromText(text) {
+  if (!text) {
+    return null;
+  }
+
+  const lines = text
+    .split(/\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const patterns = [
+    /(\d[\d\s]*)\s+оцен(?:ка|ки|ок)(?=\s|$)/i,
+    /(\d[\d\s]*)\s+рейтинг(?:ов|а)?(?=\s|$)/i,
+  ];
+
+  for (const line of lines) {
+    for (const pattern of patterns) {
+      const match = line.match(pattern);
+
+      if (match) {
+        return Number(match[1].replace(/\s+/g, ''));
+      }
+    }
+  }
+
+  return null;
 }
 
 async function extractReviewCountFromReviewsPage(page) {
   const candidateTexts = await page.evaluate(() => {
     const selectors = [
-      'button',
-      'a',
       '[role="tab"]',
+      'a[href*="reviews"]',
       '[class*="tabs"]',
       '[class*="business-card-title-view"]',
-      '[class*="business-reviews-card"]',
+      '[class*="business-reviews-card-view__title"]',
+      '[class*="business-reviews-card-view__header"]',
+      '[class*="business-reviews-card__title"]',
+      '[class*="reviews-card__title"]',
+      '[class*="reviews-card__header"]',
     ];
 
     const texts = [];
 
     for (const selector of selectors) {
       document.querySelectorAll(selector).forEach((element) => {
-        const text = element.innerText;
+        const text = [
+          element.getAttribute('aria-label') || '',
+          element.getAttribute('title') || '',
+          element.innerText || '',
+        ].join(' ');
 
         if (text && /отзыв/i.test(text)) {
           texts.push(text);
         }
       });
-    }
-
-    const bodyText = document.body?.innerText;
-
-    if (bodyText) {
-      texts.push(bodyText);
     }
 
     return texts;
@@ -410,12 +828,16 @@ function parseReviewCountFromText(text) {
   const lines = text
     .split(/\n/)
     .map((line) => line.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((line) => /отзыв/i.test(line));
 
   const patterns = [
+    /\bОтзывы\s+(\d[\d\s]*)\b/i,
     /^Отзывы\s+(\d[\d\s]*)$/i,
+    /^Отзывы\s*\(?(\d[\d\s]*)\)?$/i,
     /^(\d[\d\s]*)\s+отзыв(?:ов|а)?$/i,
     /^(\d[\d\s]*)\s+отзыв(?:ов|а)?\s+пользовател/i,
+    /\b(\d[\d\s]*)\s+отзыв(?:ов|а)?\b/i,
   ];
 
   for (const line of lines) {
@@ -431,65 +853,99 @@ function parseReviewCountFromText(text) {
   return null;
 }
 
-async function openReviewsTab(page) {
+async function openReviewsTab(page, companyId, state) {
   const reviewTabCandidates = [
-    page.getByText(/Отзывы/i).first(),
-    page.locator('a[href*="reviews"]').first(),
-    page.locator('button').filter({ hasText: /Отзывы/i }).first(),
     page.locator('[role="tab"]').filter({ hasText: /Отзывы/i }).first(),
+    page.locator('button').filter({ hasText: /Отзывы/i }).first(),
+    page.locator('a[href*="reviews"]').first(),
+    page.getByText(/Отзывы/i).first(),
   ];
 
   for (const candidate of reviewTabCandidates) {
     try {
       if (await candidate.isVisible({ timeout: 3000 })) {
-        await candidate.click({ timeout: 10000 });
-        await page.waitForTimeout(2000);
-        return;
+        await candidate.click({ timeout: getActionTimeout(state) });
+        await page.waitForTimeout(2500);
+
+        if (await hasReviewsSurface(page)) {
+          return;
+        }
       }
     } catch {
       // пробуем следующий вариант
     }
   }
 
-  const reviewUrl = buildReviewsUrl(page.url());
+  const reviewUrl = buildReviewsUrl(page.url(), companyId);
 
   if (reviewUrl) {
-    await page.goto(reviewUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: DEFAULT_TIMEOUT,
-    });
+    try {
+      await page.goto(reviewUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: getActionTimeout(state),
+      });
+      await page.waitForTimeout(3000);
 
-    await page.waitForTimeout(3000);
-    return;
+      if (await hasReviewsSurface(page)) {
+        return;
+      }
+    } catch {
+      // ниже бросаем структурированную ошибку
+    }
   }
 
   throw new ParserError(
     'REVIEWS_TAB_NOT_FOUND',
-    'Не удалось открыть вкладку с отзывами.'
+    'Не удалось открыть вкладку с отзывами.',
+    { url: page.url(), company_id: companyId }
   );
 }
 
-function buildReviewsUrl(currentUrl) {
+async function hasReviewsSurface(page) {
+  return await page.evaluate(() => {
+    const reviewNodes = document.querySelectorAll(
+      '[class~="business-reviews-card-view__review"], [class*="business-reviews-card-view__review"], [class*="business-review-view"]'
+    );
+    const text = document.body?.innerText || '';
+
+    return (
+      /\/reviews(?:[/?#]|$)/i.test(window.location.href) ||
+      reviewNodes.length > 0 ||
+      /Показать полностью|Читать полностью|Ответить|Сначала новые|Сначала полезные|Отзывы пользователей|Нет отзывов/i.test(text)
+    );
+  }).catch(() => /\/reviews(?:[/?#]|$)/i.test(page.url()));
+}
+
+function buildReviewsUrl(currentUrl, companyId) {
   try {
     const url = new URL(currentUrl);
 
-    if (!url.pathname.endsWith('/reviews')) {
-      url.pathname = url.pathname.replace(/\/$/, '') + '/reviews';
+    if (url.pathname.includes('/maps/org/')) {
+      if (!url.pathname.endsWith('/reviews')) {
+        url.pathname = url.pathname.replace(/\/$/, '') + '/reviews';
+      }
+
+      return url.toString();
     }
 
-    return url.toString();
+    if (isValidCompanyId(companyId)) {
+      return `${url.origin}/maps/org/${companyId}/reviews`;
+    }
+
+    return null;
   } catch {
     return null;
   }
 }
 
-async function collectReviews(page, maxReviews) {
+async function collectReviews(page, maxReviews, state) {
   const scrollContainer = await findReviewsScrollContainer(page);
 
   if (!scrollContainer) {
     throw new ParserError(
       'REVIEWS_CONTAINER_NOT_FOUND',
-      'Не удалось найти контейнер со списком отзывов.'
+      'Не удалось найти контейнер со списком отзывов.',
+      { url: page.url() }
     );
   }
 
@@ -498,17 +954,25 @@ async function collectReviews(page, maxReviews) {
   let stableIterations = 0;
   let previousCount = 0;
 
-  for (let iteration = 0; iteration < 120; iteration += 1) {
+  for (let iteration = 0; iteration < SCROLL_ITERATION_LIMIT; iteration += 1) {
+    ensureNotTimedOut(state);
     await clickExpandReviewTexts(page);
+    await clickLoadMoreReviews(page);
 
     const currentReviews = await extractVisibleReviews(page);
 
     for (const review of currentReviews) {
-      const hash = createReviewHash(review);
+      const preparedReview = normalizeReview(review);
+
+      if (!preparedReview) {
+        continue;
+      }
+
+      const hash = createReviewHash(preparedReview);
 
       if (!seenHashes.has(hash)) {
         seenHashes.add(hash);
-        reviews.push(review);
+        reviews.push(preparedReview);
       }
     }
 
@@ -556,13 +1020,48 @@ async function clickExpandReviewTexts(page) {
   await page.waitForTimeout(300);
 }
 
+async function clickLoadMoreReviews(page) {
+  const clicked = await page.evaluate(() => {
+    const elements = Array.from(document.querySelectorAll('button, a, span, div'));
+
+    for (const element of elements) {
+      const text = element.innerText?.replace(/\s+/g, ' ').trim();
+
+      if (!text) {
+        continue;
+      }
+
+      if (!/^(Посмотреть все \d[\d\s]* отзыв(?:ов|а)?|Показать ещё|Ещё отзывы)$/i.test(text)) {
+        continue;
+      }
+
+      const clickable = element.closest('button, a, [role="button"]') || element;
+
+      try {
+        clickable.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    return false;
+  });
+
+  if (clicked) {
+    await page.waitForTimeout(1500);
+  }
+}
+
 async function findReviewsScrollContainer(page) {
   const selectors = [
+    '[class*="business-reviews-card-view"]',
+    '[class*="business-reviews-card"]',
+    '[class*="reviews-card"]',
+    '[class*="reviews"]',
     '[class*="scroll__container"]',
     '[class*="scrollable"]',
-    '[class*="reviews"]',
-    '[class*="business-card"]',
-    'body',
+    '[class*="sidebar-view"]',
   ];
 
   for (const selector of selectors) {
@@ -571,7 +1070,13 @@ async function findReviewsScrollContainer(page) {
     try {
       const isVisible = await locator.isVisible({ timeout: 3000 });
 
-      if (isVisible) {
+      if (!isVisible) {
+        continue;
+      }
+
+      const text = await locator.innerText({ timeout: 3000 }).catch(() => '');
+
+      if (isReviewsListText(text)) {
         return selector;
       }
     } catch {
@@ -579,14 +1084,24 @@ async function findReviewsScrollContainer(page) {
     }
   }
 
+  const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+
+  if (isReviewsListText(bodyText)) {
+    return 'body';
+  }
+
   return null;
+}
+
+function isReviewsListText(text) {
+  return /Показать полностью|Читать полностью|Ответить|Сначала новые|Сначала полезные|Отзывы пользователей|Нет отзывов|По умолчанию|Посмотреть все \d[\d\s]* отзыв|\b\d[\d\s]* отзыв(?:ов|а)?\b/i.test(text);
 }
 
 async function scrollReviewsContainer(page, selector) {
   await page.evaluate((containerSelector) => {
     const container = document.querySelector(containerSelector);
 
-    if (container) {
+    if (container && container !== document.body) {
       container.scrollTop = container.scrollHeight;
       container.dispatchEvent(new Event('scroll', { bubbles: true }));
       return;
@@ -595,7 +1110,7 @@ async function scrollReviewsContainer(page, selector) {
     window.scrollTo(0, document.body.scrollHeight);
   }, selector);
 
-  await page.mouse.wheel(0, 2000);
+  await page.mouse.wheel(0, 2200);
 }
 
 async function extractVisibleReviews(page) {
@@ -1016,6 +1531,249 @@ async function extractVisibleReviews(page) {
   });
 }
 
+function buildResult({
+  organization,
+  reviews,
+  sourceUrl,
+  finalUrl,
+  maxReviews,
+  reviewCountFromPage,
+  startedAt,
+  warnings,
+}) {
+  const normalizedReviews = dedupeReviews(
+    reviews
+      .map(normalizeReview)
+      .filter(Boolean)
+  );
+
+  const organizationResult = {
+    yandex_company_id: organization.yandexCompanyId,
+    name: normalizeText(organization.name),
+    rating: normalizeNullableNumber(organization.rating),
+    rating_count: normalizeNullableInteger(organization.ratingCount),
+    review_count: normalizeNullableInteger(reviewCountFromPage),
+  };
+
+  if (organizationResult.rating === null) {
+    warnings.push('RATING_NOT_FOUND');
+  }
+
+  if (organizationResult.rating_count === null) {
+    warnings.push('RATING_COUNT_NOT_FOUND');
+  }
+
+  if (organizationResult.review_count === null) {
+    warnings.push('REVIEW_COUNT_NOT_FOUND');
+  }
+
+  if (normalizedReviews.length === 0) {
+    warnings.push('NO_TEXT_REVIEWS_FOUND');
+  }
+
+  if (
+    organizationResult.review_count !== null &&
+    normalizedReviews.length < organizationResult.review_count
+  ) {
+    warnings.push('ONLY_PARTIAL_REVIEWS_PARSED');
+  }
+
+  return {
+    organization: organizationResult,
+    reviews: normalizedReviews,
+    meta: {
+      source_url: sourceUrl,
+      final_url: finalUrl,
+      parsed_reviews_count: normalizedReviews.length,
+      max_reviews: maxReviews,
+      duration_ms: Date.now() - startedAt,
+      parsed_at: new Date().toISOString(),
+      warnings: uniqueStrings(warnings),
+    },
+  };
+}
+
+function validateResult(result) {
+  const invalidReasons = [];
+  const organization = result?.organization;
+
+  if (!organization || typeof organization !== 'object') {
+    invalidReasons.push('organization must be an object');
+  } else {
+    if (!isValidCompanyId(organization.yandex_company_id)) {
+      invalidReasons.push('organization.yandex_company_id must be filled');
+    }
+
+    if (typeof organization.name !== 'string' || organization.name.trim() === '') {
+      invalidReasons.push('organization.name must be filled');
+    }
+
+    if (!isNullableNumberInRange(organization.rating, 1, 5)) {
+      invalidReasons.push('organization.rating must be null or number from 1 to 5');
+    }
+
+    if (!isNullableNonNegativeInteger(organization.rating_count)) {
+      invalidReasons.push('organization.rating_count must be null or number >= 0');
+    }
+
+    if (!isNullableNonNegativeInteger(organization.review_count)) {
+      invalidReasons.push('organization.review_count must be null or number >= 0');
+    }
+  }
+
+  if (!Array.isArray(result?.reviews)) {
+    invalidReasons.push('reviews must be an array');
+  } else {
+    result.reviews.forEach((review, index) => {
+      if (!isValidReview(review)) {
+        invalidReasons.push(`reviews[${index}] has invalid shape`);
+      }
+    });
+  }
+
+  if (!result?.meta || !Array.isArray(result.meta.warnings)) {
+    invalidReasons.push('meta.warnings must be an array');
+  }
+
+  if (invalidReasons.length > 0) {
+    throw new ParserError(
+      'INVALID_RESULT',
+      'Итоговый результат не прошёл валидацию.',
+      { reasons: invalidReasons }
+    );
+  }
+}
+
+function isValidReview(review) {
+  if (!review || typeof review !== 'object') {
+    return false;
+  }
+
+  return (
+    (typeof review.author === 'string' || review.author === null) &&
+    (typeof review.date === 'string' || review.date === null) &&
+    typeof review.text === 'string' &&
+    review.text.trim() !== '' &&
+    !isServiceText(review.text) &&
+    isNullableNumberInRange(review.rating, 1, 5) &&
+    (typeof review.company_response === 'string' || review.company_response === null)
+  );
+}
+
+function normalizeReview(review) {
+  if (!review || typeof review !== 'object') {
+    return null;
+  }
+
+  const text = cleanReviewTextOutside(review.text);
+
+  if (!text) {
+    return null;
+  }
+
+  const normalized = {
+    author: cleanAuthorOutside(review.author),
+    date: normalizeNullableString(review.date),
+    text,
+    rating: normalizeNullableNumber(review.rating),
+    company_response: cleanReviewTextOutside(review.company_response),
+  };
+
+  if (!isNullableNumberInRange(normalized.rating, 1, 5)) {
+    normalized.rating = null;
+  }
+
+  return normalized;
+}
+
+function dedupeReviews(reviews) {
+  const seenHashes = new Set();
+  const result = [];
+
+  for (const review of reviews) {
+    const hash = createReviewHash(review);
+
+    if (seenHashes.has(hash)) {
+      continue;
+    }
+
+    seenHashes.add(hash);
+    result.push(review);
+  }
+
+  return result;
+}
+
+function cleanAuthorOutside(value) {
+  const text = normalizeNullableString(value);
+
+  if (!text) {
+    return null;
+  }
+
+  const cleaned = text
+    .replace(/\bПодписаться\b/gi, '')
+    .replace(/\bВы подписаны\b/gi, '')
+    .replace(/\bЗнаток города\s+\d+\s+уровня\b/gi, '')
+    .replace(/\bДегустатор\s+\d+\s+уровня\b/gi, '')
+    .replace(/\bНовичок\s+\d+\s+уровня\b/gi, '')
+    .replace(/\bМастер\s+\d+\s+уровня\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned || isServiceText(cleaned)) {
+    return null;
+  }
+
+  return cleaned;
+}
+
+function cleanReviewTextOutside(value) {
+  const text = normalizeNullableString(value);
+
+  if (!text || isServiceText(text) || isProfileLevelText(text)) {
+    return null;
+  }
+
+  return text;
+}
+
+function isServiceText(value) {
+  const text = normalizeText(value);
+  return !text || SERVICE_TEXTS.some((serviceText) => serviceText.toLowerCase() === text.toLowerCase());
+}
+
+function isProfileLevelText(value) {
+  return /(?:Знаток города|Дегустатор|Новичок|Мастер)\s+\d+\s+уровня/i.test(value);
+}
+
+async function assertNotYandexBlocked(page) {
+  const evidence = await page.evaluate(() => {
+    const bodyText = document.body?.innerText || '';
+    const title = document.title || '';
+
+    return `${title}\n${bodyText}`.slice(0, 50000);
+  }).catch(() => '');
+
+  const blockPatterns = [
+    /captcha/i,
+    /Введите символы/i,
+    /Подтвердите,?\s+что вы не робот/i,
+    /Доступ ограничен/i,
+    /\brobot\b/i,
+  ];
+
+  for (const pattern of blockPatterns) {
+    if (pattern.test(evidence)) {
+      throw new ParserError(
+        'YANDEX_BLOCKED',
+        'Похоже, Яндекс показал капчу или антибот-страницу.',
+        { matched: pattern.source, url: page.url() }
+      );
+    }
+  }
+}
+
 async function getTextBySelector(page, selector) {
   try {
     const locator = page.locator(selector).first();
@@ -1031,11 +1789,48 @@ async function getTextBySelector(page, selector) {
 }
 
 function normalizeText(value) {
-  if (!value) {
+  if (typeof value !== 'string') {
     return null;
   }
 
-  return value.replace(/\s+/g, ' ').trim();
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized || null;
+}
+
+function normalizeNullableString(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  return normalizeText(value);
+}
+
+function normalizeNullableNumber(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const number = Number(value);
+
+  if (!Number.isFinite(number)) {
+    return null;
+  }
+
+  return number;
+}
+
+function normalizeNullableInteger(value) {
+  const number = normalizeNullableNumber(value);
+
+  if (number === null) {
+    return null;
+  }
+
+  return Number.isInteger(number) ? number : null;
 }
 
 function parseRating(value) {
@@ -1043,88 +1838,208 @@ function parseRating(value) {
     return null;
   }
 
-  const normalized = value.replace(',', '.');
+  const normalized = String(value).replace(',', '.');
 
-  const match = normalized.match(/(\d(?:\.\d)?)/);
-
-  if (!match) {
-    return null;
-  }
-
-  const rating = Number(match[1]);
-
-  if (rating < 1 || rating > 5) {
-    return null;
-  }
-
-  return rating;
-}
-
-function parseNumberByPatterns(text, patterns) {
-  if (!text) {
-    return null;
-  }
+  const patterns = [
+    /рейтинг[^\d]{0,20}(\d(?:\.\d)?)/i,
+    /(\d(?:\.\d)?)\s*из\s*5/i,
+    /^(\d(?:\.\d)?)$/,
+    /\b([1-5](?:\.\d)?)\b/,
+  ];
 
   for (const pattern of patterns) {
-    const match = text.match(pattern);
+    const match = normalized.match(pattern);
 
-    if (match) {
-      return Number(match[1].replace(/\s+/g, ''));
+    if (!match) {
+      continue;
+    }
+
+    const rating = Number(match[1]);
+
+    if (rating >= 1 && rating <= 5) {
+      return rating;
     }
   }
 
   return null;
 }
 
+function isNullableNumberInRange(value, min, max) {
+  if (value === null) {
+    return true;
+  }
+
+  return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
+}
+
+function isNullableNonNegativeInteger(value) {
+  if (value === null) {
+    return true;
+  }
+
+  return Number.isInteger(value) && value >= 0;
+}
+
 function createReviewHash(review) {
-  return [
+  const source = [
     review.author ?? '',
     review.date ?? '',
     review.text ?? '',
     review.rating ?? '',
   ].join('|');
+
+  return createHash('sha1').update(source).digest('hex');
 }
 
-function printErrorAndExit(message) {
-  console.error(
-    JSON.stringify(
-      {
-        error: {
-          code: 'INVALID_USAGE',
-          message,
-        },
-      },
-      null,
-      2
-    )
-  );
-
-  process.exit(1);
+function uniqueStrings(values) {
+  return Array.from(new Set(values.filter(Boolean)));
 }
 
-class ParserError extends Error {
-  constructor(code, message) {
-    super(message);
-    this.name = 'ParserError';
-    this.code = code;
+function getActionTimeout(state) {
+  const remaining = state.deadlineAt - Date.now();
+
+  if (remaining <= 0) {
+    throw new ParserError(
+      'PARSER_TIMEOUT',
+      `Превышено общее время работы парсера: ${state.deadlineAt - state.startedAt} мс.`,
+      { timeout_ms: state.deadlineAt - state.startedAt }
+    );
+  }
+
+  return Math.max(1000, remaining);
+}
+
+function ensureNotTimedOut(state) {
+  if (Date.now() >= state.deadlineAt) {
+    throw new ParserError(
+      'PARSER_TIMEOUT',
+      `Превышено общее время работы парсера: ${state.deadlineAt - state.startedAt} мс.`,
+      { timeout_ms: state.deadlineAt - state.startedAt }
+    );
   }
 }
 
-main().catch((error) => {
-  const code = error instanceof ParserError ? error.code : 'UNKNOWN_ERROR';
+function isPlaywrightTimeout(error) {
+  return error instanceof playwrightErrors.TimeoutError;
+}
 
-  console.error(
-    JSON.stringify(
-      {
-        error: {
-          code,
-          message: error.message,
-        },
+async function closeBrowser(browser, debug) {
+  if (!browser) {
+    return;
+  }
+
+  try {
+    await browser.close();
+  } catch (error) {
+    debugLog(debug, `Browser close failed: ${error.message}`);
+  }
+}
+
+function getBootstrapDebugState(args) {
+  const debug = {
+    enabled: args.includes('--debug'),
+    dir: path.resolve(DEFAULT_DEBUG_DIR),
+  };
+
+  const debugDirArg = args.find((arg) => arg.startsWith('--debug-dir='));
+
+  if (debugDirArg) {
+    const value = debugDirArg.slice('--debug-dir='.length).trim();
+
+    if (value) {
+      debug.dir = path.resolve(value);
+    }
+  }
+
+  return debug;
+}
+
+async function prepareDebugDir(debug) {
+  if (!debug.enabled) {
+    return;
+  }
+
+  await fs.mkdir(debug.dir, { recursive: true });
+}
+
+function debugLog(debug, message) {
+  if (!debug?.enabled) {
+    return;
+  }
+
+  console.error(`[debug] ${new Date().toISOString()} ${message}`);
+}
+
+async function saveDebugPage(page, debug, basename) {
+  if (!debug?.enabled) {
+    return;
+  }
+
+  await prepareDebugDir(debug);
+
+  const screenshotPath = path.join(debug.dir, `${basename}.png`);
+  const htmlPath = path.join(debug.dir, `${basename}.html`);
+
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    debugLog(debug, `Saved ${screenshotPath}`);
+  } catch (error) {
+    debugLog(debug, `Failed to save screenshot ${screenshotPath}: ${error.message}`);
+  }
+
+  try {
+    const html = await page.content();
+    await fs.writeFile(htmlPath, html, 'utf8');
+    debugLog(debug, `Saved ${htmlPath}`);
+  } catch (error) {
+    debugLog(debug, `Failed to save HTML ${htmlPath}: ${error.message}`);
+  }
+}
+
+async function writeDebugJson(debug, filename, payload) {
+  if (!debug?.enabled) {
+    return;
+  }
+
+  try {
+    await prepareDebugDir(debug);
+    const filePath = path.join(debug.dir, filename);
+    await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    debugLog(debug, `Saved ${filePath}`);
+  } catch (error) {
+    debugLog(debug, `Failed to save debug JSON ${filename}: ${error.message}`);
+  }
+}
+
+function createErrorEnvelope(error) {
+  if (error instanceof ParserError) {
+    return {
+      error: {
+        code: ERROR_CODES.has(error.code) ? error.code : 'UNKNOWN_ERROR',
+        message: error.message,
+        details: error.details ?? {},
       },
-      null,
-      2
-    )
-  );
+    };
+  }
 
-  process.exit(1);
-});
+  return {
+    error: {
+      code: 'UNKNOWN_ERROR',
+      message: error?.message || 'Unexpected parser error.',
+      details: {
+        name: error?.name ?? 'Error',
+      },
+    },
+  };
+}
+
+class ParserError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'ParserError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
+await bootstrap();

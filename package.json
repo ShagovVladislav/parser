@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "parse": "node yandex-parser.js"
+    "parse": "node yandex-parser.js",
+    "parse:debug": "node yandex-parser.js --debug",
+    "check": "node --check yandex-parser.js"
   },
   "dependencies": {
     "playwright": "^1.48.0"
