@@ -315,6 +315,41 @@ form.panel {
   justify-content: center;
 }
 
+.pagination-pages {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.pagination-page {
+  min-width: 42px;
+  height: 42px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #172033;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.pagination-page:hover:not(:disabled) {
+  border-color: #2557a7;
+  color: #2557a7;
+}
+
+.pagination-page.is-active {
+  border-color: #2557a7;
+  background: #2557a7;
+  color: #fff;
+}
+
+.pagination-ellipsis {
+  color: #63718a;
+  font-weight: 800;
+}
+
 .reviews-toolbar {
   display: flex;
   align-items: center;
@@ -325,22 +360,6 @@ form.panel {
 
 .reviews-toolbar .muted {
   margin: 6px 0 0;
-}
-
-.reviews-sentinel {
-  height: 1px;
-}
-
-.load-more-note,
-.reviews-end {
-  margin: 18px 0 0;
-  text-align: center;
-  color: #63718a;
-}
-
-.load-more-button {
-  display: block;
-  margin: 18px auto 0;
 }
 
 .scroll-top-button {

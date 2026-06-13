@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import * as organizationApi from '../api/organizationApi'
 import { getApiError } from '../api/http'
@@ -8,6 +8,7 @@ import ErrorAlert from '../components/ErrorAlert.vue'
 import LoadingState from '../components/LoadingState.vue'
 import OrganizationForm from '../components/OrganizationForm.vue'
 import OrganizationSummary from '../components/OrganizationSummary.vue'
+import Pagination from '../components/Pagination.vue'
 import ReviewsTable from '../components/ReviewsTable.vue'
 import { useAuth } from '../composables/useAuth'
 
@@ -20,7 +21,6 @@ const organization = ref(null)
 const reviews = ref([])
 const paginationMeta = ref(null)
 const perPage = ref(50)
-const reviewsSentinel = ref(null)
 const showScrollTop = ref(false)
 const isLoadingPage = ref(false)
 const isSubmitting = ref(false)
@@ -28,21 +28,20 @@ const isRefreshing = ref(false)
 const isLoadingReviews = ref(false)
 const error = ref(null)
 
-let reviewsObserver = null
-
-const hasMoreReviews = computed(() => {
-  return Boolean(
-    paginationMeta.value &&
-      paginationMeta.value.current_page < paginationMeta.value.last_page,
-  )
-})
-
-const reviewsTotalLabel = computed(() => {
+const reviewsSummary = computed(() => {
   if (!paginationMeta.value) {
-    return reviews.value.length
+    return 'Отзывы пока не загружены'
   }
 
-  return paginationMeta.value.total
+  const first = paginationMeta.value.from || 0
+  const last = paginationMeta.value.to || reviews.value.length
+  const total = paginationMeta.value.total || 0
+
+  if (total === 0) {
+    return 'Отзывы пока не загружены'
+  }
+
+  return `Показаны ${first}-${last} из ${total}`
 })
 
 async function loadOrganization() {
@@ -67,16 +66,18 @@ async function loadReviews(page = 1, options = {}) {
     return
   }
 
-  const shouldAppend = options.append === true
   isLoadingReviews.value = true
   error.value = null
 
   try {
     const response = await organizationApi.getReviews(page, perPage.value)
-    const nextReviews = response.data || []
 
-    reviews.value = shouldAppend ? mergeReviews(reviews.value, nextReviews) : nextReviews
+    reviews.value = response.data || []
     paginationMeta.value = response.meta || null
+
+    if (options.scroll === true) {
+      scrollToReviews()
+    }
   } catch (requestError) {
     error.value = getApiError(requestError)
   } finally {
@@ -84,19 +85,8 @@ async function loadReviews(page = 1, options = {}) {
   }
 }
 
-function mergeReviews(currentReviews, nextReviews) {
-  const seen = new Set(currentReviews.map((review) => review.id))
-  const uniqueNextReviews = nextReviews.filter((review) => !seen.has(review.id))
-
-  return [...currentReviews, ...uniqueNextReviews]
-}
-
-async function loadMoreReviews() {
-  if (!hasMoreReviews.value || isLoadingReviews.value) {
-    return
-  }
-
-  await loadReviews(paginationMeta.value.current_page + 1, { append: true })
+async function changeReviewsPage(page) {
+  await loadReviews(page, { scroll: true })
 }
 
 async function saveUrl(url) {
@@ -107,7 +97,7 @@ async function saveUrl(url) {
     organization.value = await organizationApi.saveOrganizationUrl(url)
     reviews.value = []
     paginationMeta.value = null
-    await loadReviews(1)
+    await loadReviews(1, { scroll: true })
   } catch (requestError) {
     error.value = getApiError(requestError)
   } finally {
@@ -123,7 +113,7 @@ async function refresh() {
     organization.value = await organizationApi.refreshOrganization()
     reviews.value = []
     paginationMeta.value = null
-    await loadReviews(1)
+    await loadReviews(1, { scroll: true })
   } catch (requestError) {
     error.value = getApiError(requestError)
   } finally {
@@ -134,27 +124,6 @@ async function refresh() {
 async function logout() {
   await auth.logout()
   await router.push('/login')
-}
-
-function setupReviewsObserver() {
-  if (reviewsObserver) {
-    reviewsObserver.disconnect()
-  }
-
-  if (!('IntersectionObserver' in window) || !reviewsSentinel.value) {
-    return
-  }
-
-  reviewsObserver = new IntersectionObserver(
-    ([entry]) => {
-      if (entry.isIntersecting) {
-        loadMoreReviews()
-      }
-    },
-    { rootMargin: '420px 0px' },
-  )
-
-  reviewsObserver.observe(reviewsSentinel.value)
 }
 
 function handleScroll() {
@@ -168,6 +137,19 @@ function scrollToTop() {
   })
 }
 
+function scrollToReviews() {
+  if (!paginationMeta.value) {
+    return
+  }
+
+  requestAnimationFrame(() => {
+    document.querySelector('.reviews-toolbar')?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    })
+  })
+}
+
 watch(perPage, async () => {
   if (!organization.value) {
     return
@@ -175,22 +157,16 @@ watch(perPage, async () => {
 
   reviews.value = []
   paginationMeta.value = null
-  await loadReviews(1)
+  await loadReviews(1, { scroll: true })
 })
 
 onMounted(async () => {
   await loadOrganization()
-  await nextTick()
-  setupReviewsObserver()
   window.addEventListener('scroll', handleScroll, { passive: true })
   handleScroll()
 })
 
 onBeforeUnmount(() => {
-  if (reviewsObserver) {
-    reviewsObserver.disconnect()
-  }
-
   window.removeEventListener('scroll', handleScroll)
 })
 </script>
@@ -225,10 +201,11 @@ onBeforeUnmount(() => {
     <section v-if="organization" class="reviews-toolbar">
       <div>
         <h2>Отзывы</h2>
+        <p class="muted">{{ reviewsSummary }}</p>
       </div>
 
       <label class="compact-field">
-        <span>Подгружать по</span>
+        <span>На странице</span>
         <select v-model.number="perPage" :disabled="isLoadingReviews">
           <option v-for="option in perPageOptions" :key="option" :value="option">
             {{ option }}
@@ -237,30 +214,9 @@ onBeforeUnmount(() => {
       </label>
     </section>
 
-    <LoadingState
-      v-if="isLoadingReviews && !reviews.length"
-      text="Загружаем отзывы..."
-    />
+    <LoadingState v-if="isLoadingReviews" text="Загружаем отзывы..." />
     <ReviewsTable :reviews="reviews" />
-
-    <div ref="reviewsSentinel" class="reviews-sentinel" aria-hidden="true"></div>
-
-    <div v-if="isLoadingReviews && reviews.length" class="load-more-note">
-      Загружаем следующую пачку отзывов...
-    </div>
-
-    <button
-      v-if="hasMoreReviews && !isLoadingReviews"
-      class="button button-secondary load-more-button"
-      type="button"
-      @click="loadMoreReviews"
-    >
-      Загрузить ещё
-    </button>
-
-    <p v-if="paginationMeta && !hasMoreReviews && reviews.length" class="reviews-end">
-      Все загруженные backend отзывы показаны.
-    </p>
+    <Pagination :meta="paginationMeta" :is-loading="isLoadingReviews" @change="changeReviewsPage" />
 
     <button
       v-if="showScrollTop"
