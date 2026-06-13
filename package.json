@@ -1,13 +1,24 @@
 {
+  "$schema": "https://www.schemastore.org/package.json",
   "name": "yandex-reviews-parser",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
+    "build": "vite build",
+    "dev": "vite",
     "parse": "node yandex-parser.js",
     "parse:debug": "node yandex-parser.js --debug",
     "check": "node --check yandex-parser.js"
   },
   "dependencies": {
     "playwright": "^1.48.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "concurrently": "^9.0.1",
+    "laravel-vite-plugin": "^3.1",
+    "tailwindcss": "^4.0.0",
+    "vite": "^8.0.0"
   }
 }
