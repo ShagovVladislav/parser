@@ -1,0 +1,11 @@
+{
+  "name": "yandex-reviews-parser",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "parse": "node yandex-parser.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}
