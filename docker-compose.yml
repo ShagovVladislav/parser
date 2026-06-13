@@ -1,0 +1,52 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_URL: http://localhost:8000
+      FRONTEND_URL: http://localhost:5173
+      SANCTUM_STATEFUL_DOMAINS: localhost:5173,127.0.0.1:5173,localhost:8000,127.0.0.1:8000
+      SESSION_DOMAIN: localhost
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: parser
+      DB_USERNAME: parser
+      DB_PASSWORD: parser
+      QUEUE_CONNECTION: database
+      CACHE_STORE: database
+      SESSION_DRIVER: database
+      YANDEX_PARSER_NODE_BINARY: node
+      YANDEX_PARSER_SCRIPT_PATH: /var/www/html/yandex-parser.js
+      YANDEX_PARSER_MAX_REVIEWS: 700
+      YANDEX_PARSER_TIMEOUT: 300
+      YANDEX_PARSER_DEBUG: "false"
+      YANDEX_PARSER_DEBUG_DIR: /var/www/html/storage/app/parser-debug
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "54330:5432"
+    environment:
+      POSTGRES_DB: parser
+      POSTGRES_USER: parser
+      POSTGRES_PASSWORD: parser
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parser -d parser"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  postgres_data:
