@@ -9,8 +9,6 @@ defineProps({
 
 <template>
   <section class="reviews-section">
-    <h2>Отзывы</h2>
-
     <div v-if="!reviews.length" class="empty-panel">
       Отзывы пока не загружены.
     </div>
@@ -23,11 +21,6 @@ defineProps({
       </div>
 
       <p>{{ review.text }}</p>
-
-      <div v-if="review.company_response" class="company-response">
-        <strong>Ответ компании</strong>
-        <p>{{ review.company_response }}</p>
-      </div>
     </article>
   </section>
 </template>

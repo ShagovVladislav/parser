@@ -162,7 +162,6 @@ class OrganizationImportService
                     'review_date_text' => $review['date'] ?? null,
                     'text' => $text,
                     'rating' => $review['rating'] ?? null,
-                    'company_response' => $review['company_response'] ?? null,
                 ],
             );
         }

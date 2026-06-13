@@ -15,7 +15,6 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property string|null $review_date_text
  * @property string $text
  * @property int|null $rating
- * @property string|null $company_response
  */
 class Review extends Model
 {
@@ -32,7 +31,6 @@ class Review extends Model
         'review_date_text',
         'text',
         'rating',
-        'company_response',
     ];
 
     /**

@@ -1025,7 +1025,16 @@ async function clickLoadMoreReviews(page) {
     const elements = Array.from(document.querySelectorAll('button, a, span, div'));
 
     for (const element of elements) {
-      const text = element.innerText?.replace(/\s+/g, ' ').trim();
+      const text = [
+        element.innerText,
+        element.textContent,
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 
       if (!text) {
         continue;
@@ -1054,43 +1063,63 @@ async function clickLoadMoreReviews(page) {
 }
 
 async function findReviewsScrollContainer(page) {
-  const selectors = [
-    '[class*="business-reviews-card-view"]',
-    '[class*="business-reviews-card"]',
-    '[class*="reviews-card"]',
-    '[class*="reviews"]',
-    '[class*="scroll__container"]',
-    '[class*="scrollable"]',
-    '[class*="sidebar-view"]',
-  ];
+  const found = await page.evaluate(() => {
+    const marker = 'data-parser-reviews-scroll-container';
+    const previous = document.querySelector(`[${marker}="true"]`);
 
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-
-    try {
-      const isVisible = await locator.isVisible({ timeout: 3000 });
-
-      if (!isVisible) {
-        continue;
-      }
-
-      const text = await locator.innerText({ timeout: 3000 }).catch(() => '');
-
-      if (isReviewsListText(text)) {
-        return selector;
-      }
-    } catch {
-      // пробуем следующий селектор
+    if (previous) {
+      previous.removeAttribute(marker);
     }
-  }
 
-  const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+    const isReviewsText = (text) => {
+      return /Показать полностью|Читать полностью|Ответить|Сначала новые|Сначала полезные|Отзывы пользователей|Нет отзывов|По умолчанию|Посмотреть все \d[\d\s]* отзыв|\b\d[\d\s]* отзыв(?:ов|а)?\b/i.test(text || '');
+    };
 
-  if (isReviewsListText(bodyText)) {
-    return 'body';
-  }
+    const candidates = Array.from(document.querySelectorAll([
+      '[class*="scroll__container"]',
+      '[class*="scrollable"]',
+      '[class*="sidebar-view"]',
+      '[class*="business-reviews-card-view"]',
+      '[class*="business-reviews-card"]',
+      '[class*="reviews-card"]',
+      '[class*="reviews"]',
+      'main',
+      'body',
+    ].join(',')));
 
-  return null;
+    const scrollableCandidates = candidates
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const overflowY = window.getComputedStyle(element).overflowY;
+        const canScroll = element.scrollHeight > element.clientHeight + 80;
+        const hasUsefulText = isReviewsText(element.innerText || element.textContent || '');
+        const isVisible = rect.width > 0 && rect.height > 0;
+
+        return isVisible && hasUsefulText && canScroll && overflowY !== 'hidden';
+      })
+      .sort((a, b) => {
+        const aDelta = a.scrollHeight - a.clientHeight;
+        const bDelta = b.scrollHeight - b.clientHeight;
+
+        return bDelta - aDelta;
+      });
+
+    const best = scrollableCandidates[0];
+
+    if (best) {
+      best.setAttribute(marker, 'true');
+      return true;
+    }
+
+    if (isReviewsText(document.body.innerText || '')) {
+      document.body.setAttribute(marker, 'true');
+      return true;
+    }
+
+    return false;
+  });
+
+  return found ? '[data-parser-reviews-scroll-container="true"]' : null;
 }
 
 function isReviewsListText(text) {
@@ -1099,18 +1128,31 @@ function isReviewsListText(text) {
 
 async function scrollReviewsContainer(page, selector) {
   await page.evaluate((containerSelector) => {
-    const container = document.querySelector(containerSelector);
+    const findContainer = () => {
+      const marked = document.querySelector(containerSelector);
+
+      if (marked) {
+        return marked;
+      }
+
+      return Array.from(document.querySelectorAll('[class*="scroll__container"], [class*="scrollable"], body'))
+        .filter((element) => element.scrollHeight > element.clientHeight + 80)
+        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0] || document.body;
+    };
+
+    const container = findContainer();
 
     if (container && container !== document.body) {
-      container.scrollTop = container.scrollHeight;
+      const distance = Math.max(Math.floor(container.clientHeight * 0.85), 700);
+      container.scrollTop = Math.min(container.scrollTop + distance, container.scrollHeight);
       container.dispatchEvent(new Event('scroll', { bubbles: true }));
       return;
     }
 
-    window.scrollTo(0, document.body.scrollHeight);
+    window.scrollBy(0, Math.max(Math.floor(window.innerHeight * 0.85), 700));
   }, selector);
 
-  await page.mouse.wheel(0, 2200);
+  await page.mouse.wheel(0, 2800);
 }
 
 async function extractVisibleReviews(page) {
@@ -1125,14 +1167,12 @@ async function extractVisibleReviews(page) {
         const date = extractDate(node, lines);
         const text = extractReviewText(node, lines, author, date);
         const rating = getRatingFromNode(node);
-        const companyResponse = extractCompanyResponse(node);
 
         return {
           author,
           date,
           text,
           rating,
-          company_response: companyResponse,
         };
       })
       .filter((review) => {
@@ -1258,26 +1298,6 @@ async function extractVisibleReviews(page) {
       candidates.sort((a, b) => b.length - a.length);
 
       return candidates[0];
-    }
-
-    function extractCompanyResponse(root) {
-      const selectors = [
-        '[class*="business-review-view__comment"]',
-        '[class*="business-review-view__reply"]',
-        '[class*="review-view__reply"]',
-        '[class*="reply"]',
-      ];
-
-      for (const selector of selectors) {
-        const value = getFirstText(root, [selector]);
-        const cleaned = cleanReviewText(value);
-
-        if (cleaned) {
-          return cleaned;
-        }
-      }
-
-      return null;
     }
 
     function getFirstText(root, selectors) {
@@ -1655,8 +1675,7 @@ function isValidReview(review) {
     typeof review.text === 'string' &&
     review.text.trim() !== '' &&
     !isServiceText(review.text) &&
-    isNullableNumberInRange(review.rating, 1, 5) &&
-    (typeof review.company_response === 'string' || review.company_response === null)
+    isNullableNumberInRange(review.rating, 1, 5)
   );
 }
 
@@ -1676,7 +1695,6 @@ function normalizeReview(review) {
     date: normalizeNullableString(review.date),
     text,
     rating: normalizeNullableNumber(review.rating),
-    company_response: cleanReviewTextOutside(review.company_response),
   };
 
   if (!isNullableNumberInRange(normalized.rating, 1, 5)) {

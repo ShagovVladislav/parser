@@ -12,6 +12,8 @@ class ReviewController extends Controller
 {
     public function index(Request $request): AnonymousResourceCollection|JsonResponse
     {
+        $perPage = min(max($request->integer('per_page', 50), 1), 100);
+
         $organization = $request->user()
             ->organizations()
             ->oldest('id')
@@ -22,7 +24,8 @@ class ReviewController extends Controller
                 'data' => [],
                 'meta' => [
                     'current_page' => 1,
-                    'per_page' => 50,
+                    'last_page' => 1,
+                    'per_page' => $perPage,
                     'total' => 0,
                 ],
             ]);
@@ -30,7 +33,8 @@ class ReviewController extends Controller
 
         $reviews = $organization->reviews()
             ->latest('id')
-            ->paginate(50);
+            ->paginate($perPage)
+            ->withQueryString();
 
         return ReviewResource::collection($reviews);
     }

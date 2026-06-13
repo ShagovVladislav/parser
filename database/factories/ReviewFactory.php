@@ -33,7 +33,6 @@ class ReviewFactory extends Factory
             'review_date_text' => fake()->date(),
             'text' => fake()->paragraph(),
             'rating' => fake()->numberBetween(1, 5),
-            'company_response' => fake()->optional()->paragraph(),
         ];
     }
 }

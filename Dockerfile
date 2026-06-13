@@ -30,7 +30,7 @@ RUN composer install --no-interaction --prefer-dist \
     && npx playwright install --with-deps chromium \
     && chmod +x docker/entrypoint.sh \
     && cp docker/entrypoint.sh /usr/local/bin/laravel-entrypoint \
-    && mkdir -p storage bootstrap/cache \
+    && mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views bootstrap/cache \
     && chmod -R ug+rw storage bootstrap/cache
 
 EXPOSE 8000

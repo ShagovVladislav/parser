@@ -19,7 +19,6 @@ return new class extends Migration
             $table->string('review_date_text')->nullable();
             $table->longText('text');
             $table->unsignedTinyInteger('rating')->nullable();
-            $table->longText('company_response')->nullable();
             $table->timestamps();
 
             $table->index('organization_id');

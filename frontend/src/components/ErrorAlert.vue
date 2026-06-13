@@ -1,5 +1,7 @@
 <script setup>
-defineProps({
+import { computed } from 'vue'
+
+const props = defineProps({
   error: {
     type: [Object, String, Error],
     default: null,
@@ -23,16 +25,22 @@ function validationMessages(error) {
     return []
   }
 
-  return Object.values(error.errors).flat()
+  return [...new Set(Object.values(error.errors).flat())]
 }
+
+const visibleValidationMessages = computed(() => {
+  const message = mainMessage(props.error)
+
+  return validationMessages(props.error).filter((item) => item !== message)
+})
 </script>
 
 <template>
   <div v-if="error" class="alert alert-error" role="alert">
     <strong>{{ mainMessage(error) }}</strong>
 
-    <ul v-if="validationMessages(error).length" class="alert-list">
-      <li v-for="message in validationMessages(error)" :key="message">
+    <ul v-if="visibleValidationMessages.length" class="alert-list">
+      <li v-for="message in visibleValidationMessages" :key="message">
         {{ message }}
       </li>
     </ul>

@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Exceptions\YandexParserException;
 use App\Models\Organization;
+use App\Models\Review;
 use App\Models\User;
 use App\Services\Yandex\YandexParserService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -90,6 +91,27 @@ class OrganizationImportApiTest extends TestCase
         $this->getJson('/api/organization/reviews?page=1')->assertUnauthorized();
     }
 
+    public function test_reviews_index_supports_per_page_and_hides_company_response(): void
+    {
+        $user = User::factory()->create();
+        Sanctum::actingAs($user);
+
+        $organization = Organization::factory()
+            ->for($user)
+            ->create();
+
+        Review::factory()
+            ->for($organization)
+            ->count(3)
+            ->create();
+
+        $this->getJson('/api/organization/reviews?per_page=2')
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonPath('meta.per_page', 2)
+            ->assertJsonMissingPath('data.0.company_response');
+    }
+
     /**
      * @return array{organization: array<string, mixed>, reviews: list<array<string, mixed>>, meta: array<string, mixed>}
      */
@@ -109,7 +131,6 @@ class OrganizationImportApiTest extends TestCase
                     'date' => '12 июня',
                     'text' => 'Good place.',
                     'rating' => 5,
-                    'company_response' => null,
                 ],
             ],
             'meta' => [

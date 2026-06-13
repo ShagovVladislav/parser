@@ -18,9 +18,9 @@ export async function refreshOrganization() {
   return response.data.data
 }
 
-export async function getReviews(page = 1) {
+export async function getReviews(page = 1, perPage = 50) {
   const response = await http.get('/api/organization/reviews', {
-    params: { page },
+    params: { page, per_page: perPage },
   })
 
   return response.data

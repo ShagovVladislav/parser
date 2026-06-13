@@ -27,6 +27,7 @@ for key in \
     APP_DEBUG \
     APP_URL \
     FRONTEND_URL \
+    FRONTEND_URLS \
     SANCTUM_STATEFUL_DOMAINS \
     SESSION_DOMAIN \
     SESSION_DRIVER \
@@ -48,6 +49,9 @@ for key in \
 do
     set_env_var "$key"
 done
+
+mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views bootstrap/cache
+chmod -R ug+rw storage bootstrap/cache
 
 if [ ! -f vendor/autoload.php ]; then
     composer install --no-interaction --prefer-dist

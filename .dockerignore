@@ -19,4 +19,5 @@ storage/app/parser-debug
 .phpunit.result.cache
 public/build
 public/hot
+frontend/dist
 *.log

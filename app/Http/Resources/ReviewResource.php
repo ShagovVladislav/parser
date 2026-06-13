@@ -18,7 +18,6 @@ class ReviewResource extends JsonResource
             'review_date_text' => $this->review_date_text,
             'text' => $this->text,
             'rating' => $this->rating,
-            'company_response' => $this->company_response,
             'created_at' => $this->created_at,
             'updated_at' => $this->updated_at,
         ];
