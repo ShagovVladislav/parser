@@ -93,6 +93,43 @@ class YandexParserServiceTest extends TestCase
         $this->fail('Expected YandexParserException was not thrown.');
     }
 
+    public function test_it_reads_structured_exception_from_debug_stderr(): void
+    {
+        config([
+            'yandex_parser.script_path' => base_path('yandex-parser.js'),
+            'yandex_parser.timeout' => 12,
+        ]);
+
+        Process::fake([
+            '*' => Process::result(
+                output: '',
+                errorOutput: "[debug] Parser started\n".json_encode([
+                    'error' => [
+                        'code' => 'COMPANY_ID_NOT_FOUND',
+                        'message' => 'Company ID was not found.',
+                        'details' => ['source_url' => 'https://yandex.ru/maps/-/test'],
+                    ],
+                ], JSON_THROW_ON_ERROR),
+                exitCode: 1,
+            ),
+        ]);
+
+        try {
+            app(YandexParserService::class)->parse('https://yandex.ru/maps/-/test');
+        } catch (YandexParserException $exception) {
+            $this->assertSame('COMPANY_ID_NOT_FOUND', $exception->parserCode);
+            $this->assertSame('Company ID was not found.', $exception->parserMessage);
+            $this->assertSame(
+                ['source_url' => 'https://yandex.ru/maps/-/test'],
+                $exception->parserDetails,
+            );
+
+            return;
+        }
+
+        $this->fail('Expected YandexParserException was not thrown.');
+    }
+
     public function test_it_rejects_invalid_success_stdout(): void
     {
         config([

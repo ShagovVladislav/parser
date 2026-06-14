@@ -14,15 +14,11 @@ class OrganizationController extends Controller
 {
     public function __construct(
         private readonly OrganizationImportService $organizationImportService,
-    ) {
-    }
+    ) {}
 
     public function show(Request $request): OrganizationResource|JsonResponse
     {
-        $organization = $request->user()
-            ->organizations()
-            ->oldest('id')
-            ->first();
+        $organization = $request->user()->currentOrganization()->first();
 
         if (! $organization) {
             return response()->json(['data' => null]);

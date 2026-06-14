@@ -17,6 +17,8 @@ class StoreOrganizationRequest extends FormRequest
         'www.yandex.com',
     ];
 
+    private const INVALID_YANDEX_MAPS_URL_MESSAGE = 'The url must be a valid Yandex Maps URL.';
+
     public function authorize(): bool
     {
         return true;
@@ -35,12 +37,16 @@ class StoreOrganizationRequest extends FormRequest
     public function withValidator(Validator $validator): void
     {
         $validator->after(function (Validator $validator): void {
+            if ($validator->errors()->has('url')) {
+                return;
+            }
+
             $url = $this->string('url')->toString();
             $host = strtolower((string) parse_url($url, PHP_URL_HOST));
             $path = (string) parse_url($url, PHP_URL_PATH);
 
             if (! in_array($host, self::ALLOWED_HOSTS, true) || ! str_contains($path, '/maps/')) {
-                $validator->errors()->add('url', 'The url must be a valid Yandex Maps URL.');
+                $validator->errors()->add('url', self::INVALID_YANDEX_MAPS_URL_MESSAGE);
             }
         });
     }

@@ -28,8 +28,7 @@ class OrganizationImportService
 
     public function __construct(
         private readonly YandexParserService $parser,
-    ) {
-    }
+    ) {}
 
     public function importForUser(User $user, string $url): Organization
     {
@@ -48,12 +47,10 @@ class OrganizationImportService
 
     public function refreshForUser(User $user): Organization
     {
-        $organization = $user->organizations()
-            ->oldest('id')
-            ->first();
+        $organization = $user->currentOrganization()->first();
 
         if (! $organization) {
-            throw (new ModelNotFoundException())->setModel(Organization::class);
+            throw (new ModelNotFoundException)->setModel(Organization::class);
         }
 
         $organization->forceFill([
@@ -74,9 +71,7 @@ class OrganizationImportService
 
     private function markAsProcessing(User $user, string $url): Organization
     {
-        $organization = $user->organizations()
-            ->oldest('id')
-            ->first();
+        $organization = $user->currentOrganization()->first();
 
         $attributes = [
             'yandex_url' => $url,
@@ -102,7 +97,7 @@ class OrganizationImportService
     }
 
     /**
-     * @param array{organization: array<string, mixed>, reviews: array<int, array<string, mixed>>, meta: array<string, mixed>} $data
+     * @param  array{organization: array<string, mixed>, reviews: array<int, array<string, mixed>>, meta: array<string, mixed>}  $data
      */
     private function persistParserResult(Organization $organization, string $url, array $data): Organization
     {
@@ -137,7 +132,7 @@ class OrganizationImportService
     }
 
     /**
-     * @param array<int, array<string, mixed>> $reviews
+     * @param  array<int, array<string, mixed>>  $reviews
      */
     private function storeReviews(Organization $organization, array $reviews): void
     {
@@ -173,7 +168,7 @@ class OrganizationImportService
     }
 
     /**
-     * @param array<string, mixed> $meta
+     * @param  array<string, mixed>  $meta
      */
     private function logWarnings(Organization $organization, array $meta): void
     {

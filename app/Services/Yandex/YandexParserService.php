@@ -25,22 +25,7 @@ class YandexParserService
         }
 
         $timeoutSeconds = (int) $config['timeout'];
-        $timeoutMilliseconds = $timeoutSeconds * 1000;
-        $command = [
-            (string) $config['node_binary'],
-            $scriptPath,
-            $url,
-            (string) ($maxReviews ?? (int) $config['max_reviews']),
-            "--timeout={$timeoutMilliseconds}",
-        ];
-
-        if ((bool) $config['debug']) {
-            $command[] = '--debug';
-
-            if (! empty($config['debug_dir'])) {
-                $command[] = '--debug-dir='.$this->resolvePath((string) $config['debug_dir']);
-            }
-        }
+        $command = $this->buildCommand($config, $scriptPath, $url, $maxReviews);
 
         try {
             $result = Process::timeout($timeoutSeconds)->run($command);
@@ -91,11 +76,11 @@ class YandexParserService
     }
 
     /**
-     * @param array<string, mixed> $fallbackDetails
+     * @param  array<string, mixed>  $fallbackDetails
      */
     private function exceptionFromErrorOutput(string $errorOutput, array $fallbackDetails): YandexParserException
     {
-        $decoded = json_decode($errorOutput, true);
+        $decoded = $this->decodeErrorOutput($errorOutput);
 
         if (is_array($decoded) && isset($decoded['error']) && is_array($decoded['error'])) {
             $error = $decoded['error'];
@@ -112,6 +97,64 @@ class YandexParserService
             'Parser process failed.',
             $fallbackDetails + ['stderr' => $errorOutput],
         );
+    }
+
+    /**
+     * @param  array<string, mixed>  $config
+     * @return list<string>
+     */
+    private function buildCommand(array $config, string $scriptPath, string $url, ?int $maxReviews): array
+    {
+        $timeoutMilliseconds = (int) $config['timeout'] * 1000;
+        $command = [
+            (string) $config['node_binary'],
+            $scriptPath,
+            $url,
+            (string) ($maxReviews ?? (int) $config['max_reviews']),
+            "--timeout={$timeoutMilliseconds}",
+        ];
+
+        if (! (bool) $config['debug']) {
+            return $command;
+        }
+
+        $command[] = '--debug';
+
+        if (! empty($config['debug_dir'])) {
+            $command[] = '--debug-dir='.$this->resolvePath((string) $config['debug_dir']);
+        }
+
+        return $command;
+    }
+
+    /**
+     * Parser debug mode may write progress lines to stderr before the JSON error envelope.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function decodeErrorOutput(string $errorOutput): ?array
+    {
+        $decoded = json_decode($errorOutput, true);
+
+        if (is_array($decoded)) {
+            return $decoded;
+        }
+
+        $errorKeyPosition = strrpos($errorOutput, '"error"');
+
+        if ($errorKeyPosition === false) {
+            return null;
+        }
+
+        $candidateStart = strrpos(substr($errorOutput, 0, $errorKeyPosition), '{');
+
+        if ($candidateStart === false) {
+            return null;
+        }
+
+        $decoded = json_decode(substr($errorOutput, $candidateStart), true);
+
+        return is_array($decoded) ? $decoded : null;
     }
 
     private function resolvePath(string $path): string

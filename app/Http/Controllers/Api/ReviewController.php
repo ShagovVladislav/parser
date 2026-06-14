@@ -10,14 +10,17 @@ use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 
 class ReviewController extends Controller
 {
+    private const DEFAULT_PER_PAGE = 50;
+
+    private const MIN_PER_PAGE = 1;
+
+    private const MAX_PER_PAGE = 100;
+
     public function index(Request $request): AnonymousResourceCollection|JsonResponse
     {
-        $perPage = min(max($request->integer('per_page', 50), 1), 100);
+        $perPage = $this->resolvePerPage($request);
 
-        $organization = $request->user()
-            ->organizations()
-            ->oldest('id')
-            ->first();
+        $organization = $request->user()->currentOrganization()->first();
 
         if (! $organization) {
             return response()->json([
@@ -37,5 +40,13 @@ class ReviewController extends Controller
             ->withQueryString();
 
         return ReviewResource::collection($reviews);
+    }
+
+    private function resolvePerPage(Request $request): int
+    {
+        return min(
+            max($request->integer('per_page', self::DEFAULT_PER_PAGE), self::MIN_PER_PAGE),
+            self::MAX_PER_PAGE,
+        );
     }
 }

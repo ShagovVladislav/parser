@@ -10,6 +10,8 @@ defineProps({
 
 const emit = defineEmits(['submit'])
 
+const ALLOWED_YANDEX_HOSTS = ['yandex.ru', 'www.yandex.ru', 'yandex.com', 'www.yandex.com']
+
 const url = ref('')
 const error = ref('')
 
@@ -21,9 +23,8 @@ function validate(value) {
   try {
     const parsed = new URL(value)
     const host = parsed.hostname.toLowerCase()
-    const isYandexHost = ['yandex.ru', 'www.yandex.ru', 'yandex.com', 'www.yandex.com'].includes(host)
 
-    if (!isYandexHost || !parsed.pathname.includes('/maps/')) {
+    if (!ALLOWED_YANDEX_HOSTS.includes(host) || !parsed.pathname.includes('/maps/')) {
       return 'Ссылка должна вести на страницу Яндекс.Карт.'
     }
   } catch {

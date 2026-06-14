@@ -12,6 +12,8 @@ import Pagination from '../components/Pagination.vue'
 import ReviewsTable from '../components/ReviewsTable.vue'
 import { useAuth } from '../composables/useAuth'
 
+const DEFAULT_PER_PAGE = 50
+const SCROLL_TOP_THRESHOLD = 700
 const router = useRouter()
 const auth = useAuth()
 
@@ -20,7 +22,7 @@ const perPageOptions = [25, 50, 100]
 const organization = ref(null)
 const reviews = ref([])
 const paginationMeta = ref(null)
-const perPage = ref(50)
+const perPage = ref(DEFAULT_PER_PAGE)
 const showScrollTop = ref(false)
 const isLoadingPage = ref(false)
 const isSubmitting = ref(false)
@@ -127,7 +129,7 @@ async function logout() {
 }
 
 function handleScroll() {
-  showScrollTop.value = window.scrollY > 700
+  showScrollTop.value = window.scrollY > SCROLL_TOP_THRESHOLD
 }
 
 function scrollToTop() {
