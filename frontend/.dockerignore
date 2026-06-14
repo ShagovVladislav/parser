@@ -1,0 +1,9 @@
+.git
+.vscode
+node_modules
+dist
+dev-server.*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example
