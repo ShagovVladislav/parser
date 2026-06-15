@@ -25,6 +25,7 @@ set_env_var() {
 for key in \
     APP_ENV \
     APP_DEBUG \
+    APP_KEY \
     APP_URL \
     FRONTEND_URL \
     FRONTEND_URLS \
